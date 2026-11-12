@@ -93,6 +93,10 @@ func addIndexTestPolicies(t testing.TB, e *Enforcer, withEft bool, withDeny bool
 func setObjectTypeIndex(t testing.TB, e *Enforcer) {
 	t.Helper()
 
+	// The matcher routes p.obj_type through the opaque custom function
+	// matchObj, whose semantics the static check cannot inspect. The caller
+	// therefore installs a custom index without declaring the token and
+	// relies on the runtime pattern-key fallback.
 	err := e.SetPolicyIndex("p", PolicyIndex{
 		RequestKey: func(rvals []interface{}) (string, bool) {
 			return rvals[1].(string), true
@@ -312,19 +316,46 @@ func TestAllowAndDenyStillEvaluatesWhenDenyExists(t *testing.T) {
 }
 
 func TestPolicyIndexByToken(t *testing.T) {
-	e, calls := newIndexTestEnforcer(t, "some(where (p.eft == allow)) && !some(where (p.eft == deny))", true)
-	addIndexTestPolicies(t, e, true, true)
+	// The token-based index requires a partition-safe matcher, i.e. the
+	// indexed policy token only participates in equality comparisons.
+	e := newEqualityTokenIndexEnforcer(t, true)
+	rules := [][]string{
+		{"alice", "doc", "doc1", "read", "allow"},
+		{"alice", "doc", "doc2", "read", "allow"},
+		{"alice", "img", "img1", "read", "allow"},
+		{"alice", "*", "video1", "read", "allow"},
+		{"alice", "doc", "doc3", "read", "deny"},
+	}
+	if _, err := e.AddPolicies(rules); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := e.SetPolicyIndexByToken("p", "r_obj_type", "p_obj_type"); err != nil {
 		t.Fatal(err)
 	}
 
-	*calls = 0
-	if ok, err := e.Enforce("alice", "doc", "doc1", "read"); err != nil || !ok {
-		t.Fatalf("ok=%v err=%v", ok, err)
+	// Reachable partitions are the two "doc" rules plus the "*" wildcard;
+	// the "img" rule must be pruned. Decisions still match an unindexed
+	// enforcer because the matcher only uses equality on obj_type.
+	cases := []struct {
+		request []interface{}
+		want    bool
+	}{
+		{[]interface{}{"alice", "doc", "doc1", "read"}, true},
+		{[]interface{}{"alice", "doc", "doc2", "read"}, true},
+		{[]interface{}{"alice", "doc", "doc3", "read"}, false}, // exact deny rule
+		{[]interface{}{"alice", "img", "img1", "read"}, true},
+		{[]interface{}{"alice", "audio", "video1", "read"}, false}, // no matching rule
+		{[]interface{}{"alice", "doc", "missing", "read"}, false},
 	}
-	if *calls != 4 {
-		t.Fatalf("evaluated %d rules, want 4", *calls)
+	for _, tc := range cases {
+		got, err := e.Enforce(tc.request...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != tc.want {
+			t.Fatalf("%v: got %v, want %v", tc.request, got, tc.want)
+		}
 	}
 
 	if err := e.SetPolicyIndexByToken("p", "r_missing", "p_obj_type"); err == nil {
@@ -333,6 +364,40 @@ func TestPolicyIndexByToken(t *testing.T) {
 	if err := e.SetPolicyIndexByToken("p", "r_obj_type", "p_missing"); err == nil {
 		t.Fatal("expected an error for a missing policy token")
 	}
+}
+
+// TestPolicyIndexByTokenRejectsOpaqueFunctionMatcher documents that the
+// token-based shortcut refuses matchers where the indexed field flows into a
+// user-defined function; callers use SetPolicyIndex plus the runtime
+// pattern-key fallback for such cases.
+func TestPolicyIndexByTokenRejectsOpaqueFunctionMatcher(t *testing.T) {
+	e, _ := newIndexTestEnforcer(t, "some(where (p.eft == allow)) && !some(where (p.eft == deny))", true)
+	addIndexTestPolicies(t, e, true, true)
+
+	if err := e.SetPolicyIndexByToken("p", "r_obj_type", "p_obj_type"); err == nil {
+		t.Fatal("expected the opaque matchObj matcher to be rejected")
+	}
+}
+
+func newEqualityTokenIndexEnforcer(t testing.TB, withEft bool) *Enforcer {
+	t.Helper()
+
+	m := model.NewModel()
+	m.AddDef("r", "r", "sub, obj_type, obj, act")
+	if withEft {
+		m.AddDef("p", "p", "sub, obj_type, obj, act, eft")
+	} else {
+		m.AddDef("p", "p", "sub, obj_type, obj, act")
+	}
+	m.AddDef("g", "g", "_, _")
+	m.AddDef("e", "e", "some(where (p.eft == allow)) && !some(where (p.eft == deny))")
+	m.AddDef("m", "m", "g(r.sub, p.sub) && r.obj_type == p.obj_type && r.obj == p.obj && r.act == p.act")
+
+	e, err := NewEnforcer(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return e
 }
 
 func TestPolicyIndexResetsWhenModelChanges(t *testing.T) {

@@ -909,7 +909,11 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 	var usePolicyIndex bool
 	if pIndex := e.getPolicyIndex(pType); pIndex != nil {
 		bucketIDs = pIndex.ensureBuilt(e.model["p"][pType])
-		requestBucket, usePolicyIndex = pIndex.requestBucket(rvals)
+		// A pattern-shaped policy key can match requests in other partitions;
+		// fall back to a full scan so the index never changes the decision.
+		if pIndex.usable() {
+			requestBucket, usePolicyIndex = pIndex.requestBucket(rvals)
+		}
 	}
 
 	var policyEffects []effector.Effect
